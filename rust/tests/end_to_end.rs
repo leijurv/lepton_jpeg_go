@@ -60,6 +60,7 @@ fn verify_decode(
         "slrcity",
         "slrhills",
         "slrindoor",
+        "zeros_in_dqt_tables",
         "tiny",
         "trailingrst",
         "trailingrst2",
