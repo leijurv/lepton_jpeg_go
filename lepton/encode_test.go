@@ -415,3 +415,49 @@ func TestVPXBoolWriterGridRoundtrip(t *testing.T) {
 		})
 	}
 }
+
+// TestEncodeUnsupportedJpeg tests that encoding fails for unsupported JPEGs
+func TestEncodeUnsupportedJpeg(t *testing.T) {
+	testCases := []struct {
+		name        string
+		errorSubstr string
+	}{
+		{"nonoptimaleobrun", "non optimal eobruns not supported"},
+	}
+
+	imagesDir := "../rust/images"
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			jpegPath := filepath.Join(imagesDir, tc.name+".jpg")
+
+			if _, err := os.Stat(jpegPath); os.IsNotExist(err) {
+				t.Fatalf("JPEG file not found: %s", jpegPath)
+			}
+
+			// Read original JPEG
+			originalJpeg, err := os.ReadFile(jpegPath)
+			if err != nil {
+				t.Fatalf("Failed to read original JPEG: %v", err)
+			}
+
+			// Encode to Lepton - should fail
+			var leptonData bytes.Buffer
+			err = Encode(bytes.NewReader(originalJpeg), &leptonData)
+			if err == nil {
+				t.Fatalf("Expected encoding to fail for %s, but it succeeded", tc.name)
+			}
+
+			// Verify error message contains expected substring
+			errMsg := err.Error()
+			if !contains(errMsg, tc.errorSubstr) {
+				t.Errorf("Expected error to contain %q, got: %s", tc.errorSubstr, errMsg)
+			}
+		})
+	}
+}
+
+// contains checks if s contains substr (case-insensitive)
+func contains(s, substr string) bool {
+	return bytes.Contains([]byte(s), []byte(substr))
+}

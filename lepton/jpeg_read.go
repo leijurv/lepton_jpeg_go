@@ -1343,7 +1343,8 @@ func getMaxEobRun(acTable *HuffmanTable) uint16 {
 		if sym&0x0F == 0 && sym != 0xF0 { // EOB symbols have low nibble 0, except ZRL (0xF0)
 			runBits := sym >> 4
 			if runBits < 15 {
-				run := uint16(1) << runBits
+				// Max EOB run is (2 << runBits) - 1, matching Rust's formula
+				run := uint16((2 << runBits) - 1)
 				if run > maxRun {
 					maxRun = run
 				}
