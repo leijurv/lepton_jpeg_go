@@ -8,8 +8,10 @@ use cpu_time::ThreadTime;
 pub struct CpuTimeMeasure {
     #[cfg(windows)]
     start: ThreadTime,
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
     start: std::time::Instant,
+    #[cfg(target_arch = "wasm32")]
+    _dummy: (),
 }
 
 impl CpuTimeMeasure {
@@ -18,8 +20,10 @@ impl CpuTimeMeasure {
         Self {
             #[cfg(windows)]
             start: ThreadTime::now(),
-            #[cfg(not(windows))]
+            #[cfg(all(not(windows), not(target_arch = "wasm32")))]
             start: std::time::Instant::now(),
+            #[cfg(target_arch = "wasm32")]
+            _dummy: (),
         }
     }
 
@@ -29,9 +33,13 @@ impl CpuTimeMeasure {
         {
             self.start.elapsed()
         }
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(target_arch = "wasm32")))]
         {
             self.start.elapsed()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Duration::default()
         }
     }
 }

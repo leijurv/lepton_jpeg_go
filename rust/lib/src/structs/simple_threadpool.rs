@@ -195,3 +195,35 @@ impl LeptonThreadPool for SingleThreadPool {
         panic!("SingleThreadPool does not support run; execute directly instead");
     }
 }
+
+/// A thread pool backed by Rayon. This is useful for WASM builds where
+/// wasm-bindgen-rayon can hook into rayon::spawn() to use Web Workers.
+#[cfg(feature = "use_rayon")]
+pub struct RayonThreadPool {
+    num_threads: usize,
+}
+
+#[cfg(feature = "use_rayon")]
+impl RayonThreadPool {
+    /// Creates a new Rayon-based thread pool with the specified number of threads.
+    pub fn new(num_threads: usize) -> Self {
+        RayonThreadPool { num_threads }
+    }
+}
+
+#[cfg(feature = "use_rayon")]
+impl LeptonThreadPool for RayonThreadPool {
+    fn max_parallelism(&self) -> usize {
+        self.num_threads
+    }
+    fn run(&self, f: Box<dyn FnOnce() + Send + 'static>) {
+        rayon::spawn(f);
+    }
+}
+
+#[cfg(feature = "use_rayon")]
+impl Default for RayonThreadPool {
+    fn default() -> Self {
+        RayonThreadPool::new(rayon::current_num_threads())
+    }
+}

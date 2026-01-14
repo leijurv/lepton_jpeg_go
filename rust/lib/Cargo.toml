@@ -23,7 +23,11 @@ detailed_tracing = []
 # used to expose internal functions for micro benchmarking
 micro_benchmark = []
 
+# use rayon for threading (required for wasm-bindgen-rayon browser support)
+use_rayon = ["rayon"]
+
 [dependencies]
+rayon = { version = "1.10", optional = true }
 bytemuck = "1"
 byteorder = "1.4"
 flate2 = "1.0"

@@ -52,6 +52,9 @@ pub use crate::structs::simple_threadpool::{
     SingleThreadPool, ThreadPoolHolder,
 };
 
+#[cfg(feature = "use_rayon")]
+pub use crate::structs::simple_threadpool::RayonThreadPool;
+
 #[cfg(feature = "micro_benchmark")]
 /// Module that exposes internal functions for micro benchmarking
 pub mod micro_benchmark;
