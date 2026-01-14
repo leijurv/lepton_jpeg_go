@@ -20,13 +20,15 @@ import (
 )
 
 type testResult struct {
-	decompressOK      bool
-	compressOK        bool
-	roundtripOK       bool
-	rustCanCompress   bool // true if Rust can handle this file (when Go fails)
-	errMsg            string
-	originalLepSize   int // size of original .lep file
-	recompressedSize  int // size of recompressed .lep data
+	decompressOK        bool
+	compressOK          bool
+	roundtripOK         bool
+	rustDecompressOK    bool // true if Rust can decompress Go-compressed .lep
+	rustCanCompress     bool // true if Rust can handle this file (when Go fails)
+	errMsg              string
+	rustDecompressErr   string // error message if Rust decompress fails
+	originalLepSize     int    // size of original .lep file
+	recompressedSize    int    // size of recompressed .lep data
 }
 
 func main() {
@@ -43,6 +45,7 @@ func main() {
 	if rustPath == "" {
 		// Try common locations
 		candidates := []string{
+			"./target/release/lepton_jpeg_util",
 			"./rust/target/release/lepton_jpeg_util",
 			"../rust/target/release/lepton_jpeg_util",
 			"/mnt/data/Dropbox/lepton_jpeg_rust/rust/target/release/lepton_jpeg_util",
@@ -86,13 +89,15 @@ func main() {
 	var decompressPass, decompressFail int64
 	var compressPass, compressFail int64
 	var roundtripPass, roundtripFail int64
-	var goOnlyFail int64      // Files that fail in Go but work in Rust (Go bugs)
-	var rustAlsoFail int64    // Files that fail in both Go and Rust (Rust limitations)
+	var rustDecompressPass, rustDecompressFail int64 // Rust decompressing Go-compressed .lep
+	var goOnlyFail int64                             // Files that fail in Go but work in Rust (Go bugs)
+	var rustAlsoFail int64                           // Files that fail in both Go and Rust (Rust limitations)
 	var skipped int64
 	var mu sync.Mutex
 	var failedFiles []string
 	var compressFailedFiles []string
 	var goOnlyFailedFiles []string
+	var rustDecompressFailedFiles []string
 	var processed int64
 	var totalOriginalLepBytes int64   // sum of original .lep sizes for ratio calculation
 	var totalRecompressedBytes int64  // sum of recompressed sizes for ratio calculation
@@ -174,6 +179,15 @@ func main() {
 								mu.Unlock()
 							}
 						}
+						// Track Rust decompress of Go-compressed .lep
+						if result.rustDecompressOK {
+							atomic.AddInt64(&rustDecompressPass, 1)
+						} else if result.rustDecompressErr != "" {
+							atomic.AddInt64(&rustDecompressFail, 1)
+							mu.Lock()
+							rustDecompressFailedFiles = append(rustDecompressFailedFiles, result.rustDecompressErr)
+							mu.Unlock()
+						}
 					} else {
 						atomic.AddInt64(&compressFail, 1)
 						// Track whether this is a Go-only failure or Rust also fails
@@ -218,6 +232,12 @@ func main() {
 			fmt.Printf("Roundtrip:  %d/%d passed (%.1f%%)\n",
 				roundtripPass, decompressPass, 100*float64(roundtripPass)/float64(decompressPass))
 
+			// Show Rust decompress of Go-compressed .lep results
+			if rustPath != "" && compressPass > 0 {
+				fmt.Printf("Rust decompress Go .lep: %d/%d passed (%.1f%%)\n",
+					rustDecompressPass, compressPass, 100*float64(rustDecompressPass)/float64(compressPass))
+			}
+
 			// Show compression ratio for successful roundtrips
 			if totalOriginalLepBytes > 0 {
 				ratio := float64(totalRecompressedBytes) / float64(totalOriginalLepBytes)
@@ -258,6 +278,13 @@ func main() {
 	if *testCompress && len(compressFailedFiles) > 0 && len(compressFailedFiles) <= 50 {
 		fmt.Println("\nAll compress/roundtrip failed files:")
 		for _, f := range compressFailedFiles {
+			fmt.Println("  " + f)
+		}
+	}
+
+	if *testCompress && len(rustDecompressFailedFiles) > 0 && len(rustDecompressFailedFiles) <= 50 {
+		fmt.Println("\nRust failed to decompress Go-compressed .lep:")
+		for _, f := range rustDecompressFailedFiles {
 			fmt.Println("  " + f)
 		}
 	}
@@ -336,6 +363,32 @@ func testFile(dirPath, filename string, verbose, testCompress bool, rustPath str
 			filename, len(lepData), recompressed.Len())
 	}
 
+	// Step 2.5: Test if Rust can decompress the Go-compressed .lep
+	if rustPath != "" {
+		rustDecoded, rustErr := testRustDecompress(recompressed.Bytes(), rustPath, verbose)
+		if rustErr != nil {
+			result.rustDecompressErr = fmt.Sprintf("%s: rust decompress error: %v", filename, rustErr)
+			if verbose {
+				fmt.Printf("RUST DECOMPRESS FAIL: %s: %v\n", filename, rustErr)
+			}
+		} else {
+			// Verify the Rust-decoded output matches original
+			rustHash := sha256.Sum256(rustDecoded)
+			rustActualHash := hex.EncodeToString(rustHash[:])
+			if rustActualHash != expectedHash {
+				result.rustDecompressErr = fmt.Sprintf("%s: rust decompress hash mismatch (got %s)", filename, rustActualHash[:16]+"...")
+				if verbose {
+					fmt.Printf("RUST DECOMPRESS HASH MISMATCH: %s\n", filename)
+				}
+			} else {
+				result.rustDecompressOK = true
+				if verbose {
+					fmt.Printf("RUST DECOMPRESS PASS: %s\n", filename)
+				}
+			}
+		}
+	}
+
 	// Step 3: Decode recompressed lepton -> JPEG
 	redecoded, err := lepton.DecodeLeptonBytes(recompressed.Bytes())
 	if err != nil {
@@ -382,4 +435,34 @@ func testRustCompress(jpegData []byte, rustPath string, verbose bool) bool {
 
 	// Check that we got some output (lepton data)
 	return stdout.Len() > 0
+}
+
+// testRustDecompress tests if Rust can decompress the given lepton data using stdin/stdout pipes
+// Returns the decoded JPEG data and any error
+func testRustDecompress(leptonData []byte, rustPath string, verbose bool) ([]byte, error) {
+	cmd := exec.Command(rustPath)
+	cmd.Stdin = bytes.NewReader(leptonData)
+
+	// Capture stdout (the JPEG output)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	// Capture stderr for error messages
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			return nil, fmt.Errorf("%v: %s", err, errMsg)
+		}
+		return nil, err
+	}
+
+	if stdout.Len() == 0 {
+		return nil, fmt.Errorf("rust produced no output")
+	}
+
+	return stdout.Bytes(), nil
 }

@@ -31,11 +31,18 @@ func Encode(reader io.Reader, writer io.Writer) error {
 	// Calculate luma height for encoding
 	lumaHeight := jpegResult.Header.CmpInfo[0].Bcv
 
+	// Calculate segment size: this is the size of the JPEG scan data
+	// (original file minus header minus garbage data including EOI)
+	segmentSize := len(jpegData) - len(jpegResult.RawHeader) - len(jpegResult.GarbageData)
+	if segmentSize < 0 {
+		segmentSize = 0
+	}
+
 	// Create a single thread handoff for the entire image
 	handoff := ThreadHandoff{
 		LumaYStart:      0,
 		LumaYEnd:        lumaHeight,
-		SegmentSize:     0, // Will be filled in after encoding
+		SegmentSize:     uint32(segmentSize),
 		OverhangByte:    0,
 		NumOverhangBits: 0,
 	}
