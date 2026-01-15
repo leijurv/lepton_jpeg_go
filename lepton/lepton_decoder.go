@@ -157,8 +157,8 @@ func (d *LeptonDecoder) decodeRow(
 			return err
 		}
 
-		// Store the block
-		image.AppendBlock(block)
+		// Store the block at the current position
+		image.SetBlockAt(ctx.GetHereIndex(), block)
 
 		// Store neighbor summary for next block
 		ctx.SetNeighborSummaryHere(neighborSummaryCache, ns)

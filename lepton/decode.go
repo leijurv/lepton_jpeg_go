@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // limitedWriter wraps a writer and limits output to a maximum size
@@ -40,12 +41,14 @@ func DecodeLepton(input io.Reader, output io.Writer) error {
 		return fmt.Errorf("failed to read Lepton header: %w", err)
 	}
 
-	// Create block-based images for each component
+	// Create block-based images for each component and pre-allocate blocks
 	images := make([]*BlockBasedImage, header.JpegHeader.Cmpc)
 	for i := 0; i < header.JpegHeader.Cmpc; i++ {
 		ci := &header.JpegHeader.CmpInfo[i]
 		luma := &header.JpegHeader.CmpInfo[0]
 		images[i] = NewBlockBasedImage(ci, luma)
+		// Pre-allocate all blocks for parallel decoding
+		images[i].PreallocateBlocks(int(ci.Bc))
 	}
 
 	// For single-threaded decoding, read the completion marker first,
@@ -75,24 +78,44 @@ func DecodeLepton(input io.Reader, output io.Writer) error {
 	// Demultiplex the data for each thread
 	demuxer := newDemultiplexer(multiplexedData, len(header.ThreadHandoffs))
 
-	// Decode scan data for each thread partition
-	for threadIdx := 0; threadIdx < len(header.ThreadHandoffs); threadIdx++ {
-		handoff := &header.ThreadHandoffs[threadIdx]
+	// Decode scan data for each thread partition in parallel
+	numThreads := len(header.ThreadHandoffs)
+	var wg sync.WaitGroup
+	errors := make([]error, numThreads)
 
-		// Get the demultiplexed segment data for this thread
-		segmentData := demuxer.getPartitionData(threadIdx)
+	for threadIdx := 0; threadIdx < numThreads; threadIdx++ {
+		wg.Add(1)
+		go func(tid int) {
+			defer wg.Done()
 
-		// Decode the segment
-		segmentReader := bytes.NewReader(segmentData)
-		decoder, err := NewLeptonDecoder(segmentReader, header.JpegHeader)
+			handoff := &header.ThreadHandoffs[tid]
+
+			// Get the demultiplexed segment data for this thread
+			segmentData := demuxer.getPartitionData(tid)
+
+			// Decode the segment
+			segmentReader := bytes.NewReader(segmentData)
+			decoder, err := NewLeptonDecoder(segmentReader, header.JpegHeader)
+			if err != nil {
+				errors[tid] = fmt.Errorf("failed to create decoder for thread %d: %w", tid, err)
+				return
+			}
+
+			err = decoder.DecodeRowRange(images, handoff.LumaYStart, handoff.LumaYEnd, handoff.LastDC,
+				header.RecoveryInfo.MaxDpos, header.RecoveryInfo.EarlyEofEncountered)
+			if err != nil {
+				errors[tid] = fmt.Errorf("failed to decode thread %d: %w", tid, err)
+				return
+			}
+		}(threadIdx)
+	}
+
+	wg.Wait()
+
+	// Check for any errors
+	for _, err := range errors {
 		if err != nil {
-			return fmt.Errorf("failed to create decoder for thread %d: %w", threadIdx, err)
-		}
-
-		err = decoder.DecodeRowRange(images, handoff.LumaYStart, handoff.LumaYEnd, handoff.LastDC,
-			header.RecoveryInfo.MaxDpos, header.RecoveryInfo.EarlyEofEncountered)
-		if err != nil {
-			return fmt.Errorf("failed to decode thread %d: %w", threadIdx, err)
+			return err
 		}
 	}
 

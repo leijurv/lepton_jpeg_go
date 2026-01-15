@@ -148,6 +148,21 @@ func (img *BlockBasedImage) GetNumBlocks() int {
 	return len(img.blocks)
 }
 
+// PreallocateBlocks pre-allocates the blocks slice to the given size
+// This is used for parallel decoding where multiple goroutines write to different positions
+func (img *BlockBasedImage) PreallocateBlocks(count int) {
+	if count > cap(img.blocks) {
+		img.blocks = make([]AlignedBlock, count)
+	} else {
+		img.blocks = img.blocks[:count]
+	}
+}
+
+// SetBlockAt sets the block at the given index (assumes pre-allocated, no bounds check)
+func (img *BlockBasedImage) SetBlockAt(index uint32, block AlignedBlock) {
+	img.blocks[index] = block
+}
+
 // GetBlocks returns the underlying blocks slice
 func (img *BlockBasedImage) GetBlocks() []AlignedBlock {
 	return img.blocks
