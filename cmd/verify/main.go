@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -23,10 +25,12 @@ type testResult struct {
 	decompressOK        bool
 	compressOK          bool
 	roundtripOK         bool
-	rustDecompressOK    bool // true if Rust can decompress Go-compressed .lep
-	rustCanCompress     bool // true if Rust can handle this file (when Go fails)
+	rustDecompressOK    bool   // true if Rust can decompress Go-compressed .lep
+	rustCanCompress     bool   // true if Rust can handle this file (when Go fails)
+	byteIdentical       bool   // true if Go and Rust produce identical .lep output
 	errMsg              string
 	rustDecompressErr   string // error message if Rust decompress fails
+	byteIdenticalErr    string // error message if byte comparison fails
 	originalLepSize     int    // size of original .lep file
 	recompressedSize    int    // size of recompressed .lep data
 }
@@ -90,6 +94,7 @@ func main() {
 	var compressPass, compressFail int64
 	var roundtripPass, roundtripFail int64
 	var rustDecompressPass, rustDecompressFail int64 // Rust decompressing Go-compressed .lep
+	var byteIdenticalPass, byteIdenticalFail int64   // Go vs Rust byte-identical comparison
 	var goOnlyFail int64                             // Files that fail in Go but work in Rust (Go bugs)
 	var rustAlsoFail int64                           // Files that fail in both Go and Rust (Rust limitations)
 	var skipped int64
@@ -98,6 +103,7 @@ func main() {
 	var compressFailedFiles []string
 	var goOnlyFailedFiles []string
 	var rustDecompressFailedFiles []string
+	var byteIdenticalFailedFiles []string
 	var processed int64
 	var totalOriginalLepBytes int64   // sum of original .lep sizes for ratio calculation
 	var totalRecompressedBytes int64  // sum of recompressed sizes for ratio calculation
@@ -188,6 +194,15 @@ func main() {
 							rustDecompressFailedFiles = append(rustDecompressFailedFiles, result.rustDecompressErr)
 							mu.Unlock()
 						}
+						// Track byte-identical comparison (Go vs Rust compression)
+						if result.byteIdentical {
+							atomic.AddInt64(&byteIdenticalPass, 1)
+						} else if result.byteIdenticalErr != "" {
+							atomic.AddInt64(&byteIdenticalFail, 1)
+							mu.Lock()
+							byteIdenticalFailedFiles = append(byteIdenticalFailedFiles, result.byteIdenticalErr)
+							mu.Unlock()
+						}
 					} else {
 						atomic.AddInt64(&compressFail, 1)
 						// Track whether this is a Go-only failure or Rust also fails
@@ -236,6 +251,8 @@ func main() {
 			if rustPath != "" && compressPass > 0 {
 				fmt.Printf("Rust decompress Go .lep: %d/%d passed (%.1f%%)\n",
 					rustDecompressPass, compressPass, 100*float64(rustDecompressPass)/float64(compressPass))
+				fmt.Printf("Byte-identical (Go==Rust): %d/%d passed (%.1f%%)\n",
+					byteIdenticalPass, compressPass, 100*float64(byteIdenticalPass)/float64(compressPass))
 			}
 
 			// Show compression ratio for successful roundtrips
@@ -285,6 +302,13 @@ func main() {
 	if *testCompress && len(rustDecompressFailedFiles) > 0 && len(rustDecompressFailedFiles) <= 50 {
 		fmt.Println("\nRust failed to decompress Go-compressed .lep:")
 		for _, f := range rustDecompressFailedFiles {
+			fmt.Println("  " + f)
+		}
+	}
+
+	if *testCompress && len(byteIdenticalFailedFiles) > 0 && len(byteIdenticalFailedFiles) <= 20 {
+		fmt.Println("\nByte-identical failures (Go != Rust compression):")
+		for _, f := range byteIdenticalFailedFiles {
 			fmt.Println("  " + f)
 		}
 	}
@@ -363,7 +387,32 @@ func testFile(dirPath, filename string, verbose, testCompress bool, rustPath str
 			filename, len(lepData), recompressed.Len())
 	}
 
-	// Step 2.5: Test if Rust can decompress the Go-compressed .lep
+	// Step 2.5: Compare Go compression with Rust compression
+	// Since zlib implementations differ, compare: fixed header, decompressed header, and payload
+	if rustPath != "" {
+		rustCompressed, rustCompErr := getRustCompressed(decoded, rustPath)
+		if rustCompErr != nil {
+			result.byteIdenticalErr = fmt.Sprintf("%s: rust compress error: %v", filename, rustCompErr)
+			if verbose {
+				fmt.Printf("RUST COMPRESS FAIL: %s: %v\n", filename, rustCompErr)
+			}
+		} else {
+			mismatch := compareLeptonFiles(recompressed.Bytes(), rustCompressed)
+			if mismatch != "" {
+				result.byteIdenticalErr = fmt.Sprintf("%s: %s", filename, mismatch)
+				if verbose {
+					fmt.Printf("CONTENT MISMATCH: %s: %s\n", filename, mismatch)
+				}
+			} else {
+				result.byteIdentical = true
+				if verbose {
+					fmt.Printf("CONTENT IDENTICAL: %s\n", filename)
+				}
+			}
+		}
+	}
+
+	// Step 2.6: Test if Rust can decompress the Go-compressed .lep
 	if rustPath != "" {
 		rustDecoded, rustErr := testRustDecompress(recompressed.Bytes(), rustPath, verbose)
 		if rustErr != nil {
@@ -418,23 +467,123 @@ func testFile(dirPath, filename string, verbose, testCompress bool, rustPath str
 
 // testRustCompress tests if Rust can compress the given JPEG data using stdin/stdout pipes
 func testRustCompress(jpegData []byte, rustPath string, verbose bool) bool {
+	_, err := getRustCompressed(jpegData, rustPath)
+	return err == nil
+}
+
+// compareLeptonFiles compares two lepton files semantically (ignoring zlib differences)
+// Returns empty string if identical, or a description of the first difference
+func compareLeptonFiles(goData, rustData []byte) string {
+	if len(goData) < 28 || len(rustData) < 28 {
+		return "file too short for header"
+	}
+
+	// Compare fixed header bytes 0-14 (excluding byte 15 which is encoder version)
+	for i := 0; i < 15; i++ {
+		if goData[i] != rustData[i] {
+			return fmt.Sprintf("fixed header differs at byte %d: go=%02x rust=%02x", i, goData[i], rustData[i])
+		}
+	}
+
+	// Compare bytes 16-23 (git revision and original file size)
+	// Skip bytes 16-19 (git revision) as they may differ
+	// Compare bytes 20-23 (original file size)
+	if !bytes.Equal(goData[20:24], rustData[20:24]) {
+		return fmt.Sprintf("original file size differs: go=%x rust=%x", goData[20:24], rustData[20:24])
+	}
+
+	// Decompress and compare headers
+	goCompHeaderSize := binary.LittleEndian.Uint32(goData[24:28])
+	rustCompHeaderSize := binary.LittleEndian.Uint32(rustData[24:28])
+
+	goCompHeader := goData[28 : 28+goCompHeaderSize]
+	rustCompHeader := rustData[28 : 28+rustCompHeaderSize]
+
+	goHeader, err := decompressZlib(goCompHeader)
+	if err != nil {
+		return fmt.Sprintf("failed to decompress go header: %v", err)
+	}
+	rustHeader, err := decompressZlib(rustCompHeader)
+	if err != nil {
+		return fmt.Sprintf("failed to decompress rust header: %v", err)
+	}
+
+	if !bytes.Equal(goHeader, rustHeader) {
+		// Find first difference
+		minLen := len(goHeader)
+		if len(rustHeader) < minLen {
+			minLen = len(rustHeader)
+		}
+		for i := 0; i < minLen; i++ {
+			if goHeader[i] != rustHeader[i] {
+				return fmt.Sprintf("decompressed header differs at byte %d: go=%02x rust=%02x (go=%d bytes, rust=%d bytes)",
+					i, goHeader[i], rustHeader[i], len(goHeader), len(rustHeader))
+			}
+		}
+		return fmt.Sprintf("decompressed header length differs: go=%d rust=%d", len(goHeader), len(rustHeader))
+	}
+
+	// Compare payload (everything after compressed header + CMP marker)
+	goPayloadStart := 28 + int(goCompHeaderSize) + 3 // +3 for CMP marker
+	rustPayloadStart := 28 + int(rustCompHeaderSize) + 3
+
+	goPayload := goData[goPayloadStart : len(goData)-4]   // -4 for footer
+	rustPayload := rustData[rustPayloadStart : len(rustData)-4]
+
+	if !bytes.Equal(goPayload, rustPayload) {
+		minLen := len(goPayload)
+		if len(rustPayload) < minLen {
+			minLen = len(rustPayload)
+		}
+		for i := 0; i < minLen; i++ {
+			if goPayload[i] != rustPayload[i] {
+				return fmt.Sprintf("payload differs at byte %d: go=%02x rust=%02x (go=%d bytes, rust=%d bytes)",
+					i, goPayload[i], rustPayload[i], len(goPayload), len(rustPayload))
+			}
+		}
+		return fmt.Sprintf("payload length differs: go=%d rust=%d", len(goPayload), len(rustPayload))
+	}
+
+	return ""
+}
+
+// decompressZlib decompresses zlib data
+func decompressZlib(data []byte) ([]byte, error) {
+	r, err := zlib.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return ioutil.ReadAll(r)
+}
+
+// getRustCompressed compresses JPEG data using Rust and returns the lepton output
+func getRustCompressed(jpegData []byte, rustPath string) ([]byte, error) {
 	cmd := exec.Command(rustPath)
 	cmd.Stdin = bytes.NewReader(jpegData)
 
-	// Capture stdout (the lepton output) - we just need to know it succeeded
+	// Capture stdout (the lepton output)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 
-	// Suppress stderr
-	cmd.Stderr = nil
+	// Capture stderr for error messages
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
 	err := cmd.Run()
 	if err != nil {
-		return false
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			return nil, fmt.Errorf("%v: %s", err, errMsg)
+		}
+		return nil, err
 	}
 
-	// Check that we got some output (lepton data)
-	return stdout.Len() > 0
+	if stdout.Len() == 0 {
+		return nil, fmt.Errorf("rust produced no output")
+	}
+
+	return stdout.Bytes(), nil
 }
 
 // testRustDecompress tests if Rust can decompress the given lepton data using stdin/stdout pipes

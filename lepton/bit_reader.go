@@ -7,16 +7,18 @@ import (
 
 // BitReader reads JPEG Huffman-encoded bitstream, handling 0xFF escape codes
 type BitReader struct {
-	inner       io.Reader
-	bits        uint64
-	bitsLeft    uint32
-	cpos        uint32 // reset counter position
-	eof         bool
-	truncatedFF bool
-	buffer      []byte
-	bufferPos   int
-	bufferLen   int
-	totalRead   int64
+	inner            io.Reader
+	bits             uint64
+	bitsLeft         uint32
+	cpos             uint32 // reset counter position
+	eof              bool
+	truncatedFF      bool
+	buffer           []byte
+	bufferPos        int
+	bufferLen        int
+	totalRead        int64
+	dataBytesLoaded  int64 // logical data bytes loaded into bit register
+	physicalConsumed int64 // physical bytes consumed from scan data (including escapes and markers)
 }
 
 // NewBitReader creates a new BitReader
@@ -85,6 +87,8 @@ func (r *BitReader) fillRegister(bitsToRead uint32) error {
 					// Assume this was an escaped 0xff
 					r.bits = (r.bits << 8) | 0xff
 					r.bitsLeft += 8
+					r.dataBytesLoaded++
+					r.physicalConsumed++ // Only 1 byte was read before EOF
 					r.truncatedFF = true
 					continue
 				}
@@ -92,9 +96,11 @@ func (r *BitReader) fillRegister(bitsToRead uint32) error {
 			}
 
 			if next == 0 {
-				// This was an escaped 0xFF
+				// This was an escaped 0xFF (2 physical bytes -> 1 data byte)
 				r.bits = (r.bits << 8) | 0xff
 				r.bitsLeft += 8
+				r.dataBytesLoaded++
+				r.physicalConsumed += 2
 			} else {
 				// This was not an escaped 0xff
 				return NewLeptonError(ExitCodeInvalidResetCode,
@@ -103,6 +109,8 @@ func (r *BitReader) fillRegister(bitsToRead uint32) error {
 		} else {
 			r.bits = (r.bits << 8) | uint64(b)
 			r.bitsLeft += 8
+			r.dataBytesLoaded++
+			r.physicalConsumed++
 		}
 	}
 	return nil
@@ -206,17 +214,17 @@ func (r *BitReader) VerifyResetCode() error {
 	r.cpos++
 	r.bits = 0
 	r.bitsLeft = 0
+	r.physicalConsumed += 2 // Restart marker is 2 bytes
 
 	return nil
 }
 
-// StreamPosition returns the approximate position in the stream
+// StreamPosition returns the physical byte position in the scan data stream
+// This includes all bytes: data bytes, escape sequences (0xFF 0x00), and restart markers
 func (r *BitReader) StreamPosition() int64 {
-	pos := r.totalRead - int64(r.bufferLen-r.bufferPos)
-	if r.bitsLeft > 0 && !r.eof {
-		// Account for bits we've read but not consumed
-		bytesInBits := int64((r.bitsLeft + 7) / 8)
-		pos -= bytesInBits
-	}
-	return pos
+	// physicalConsumed tracks all bytes processed from the stream.
+	// We subtract bytes that are still in the bit register (not yet consumed).
+	// Use ceiling division: if any bits remain from a byte, that byte is not fully consumed.
+	bytesInRegister := int64((r.bitsLeft + 7) / 8)
+	return r.physicalConsumed - bytesInRegister
 }

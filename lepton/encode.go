@@ -5,10 +5,20 @@ import (
 	"compress/zlib"
 	"encoding/binary"
 	"io"
+	"sync"
 )
 
+// DefaultMaxThreads matches Rust's default max_partitions (8)
+const DefaultMaxThreads = 8
+
 // Encode compresses a JPEG image to Lepton format
+// Uses multi-threading based on restart intervals found in the JPEG
 func Encode(reader io.Reader, writer io.Writer) error {
+	return EncodeWithThreads(reader, writer, DefaultMaxThreads)
+}
+
+// EncodeWithThreads compresses a JPEG image to Lepton format using up to maxThreads
+func EncodeWithThreads(reader io.Reader, writer io.Writer, maxThreads int) error {
 	// Read all JPEG data (needed for header size)
 	jpegData, err := io.ReadAll(reader)
 	if err != nil {
@@ -38,44 +48,86 @@ func Encode(reader io.Reader, writer io.Writer) error {
 		segmentSize = 0
 	}
 
-	// Create a single thread handoff for the entire image
-	handoff := ThreadHandoff{
-		LumaYStart:      0,
-		LumaYEnd:        lumaHeight,
-		SegmentSize:     uint32(segmentSize),
-		OverhangByte:    0,
-		NumOverhangBits: 0,
-	}
-
 	// Set up header flags
 	jpegResult.Header.Use16BitDCEstimate = true
 	jpegResult.Header.Use16BitAdvPredict = true
 
-	// Encode the image data to a buffer first so we know the size
-	var encodedData bytes.Buffer
-	encoder, err := NewLeptonEncoder(&encodedData, jpegResult.Header)
-	if err != nil {
-		return err
+	// Determine number of threads based on partition count (matching Rust behavior)
+	// Rust uses the number of restart intervals (partitions) from the JPEG, not image dimensions
+	numPartitions := len(jpegResult.Partitions)
+	if numPartitions == 0 {
+		numPartitions = 1 // If no partitions, treat as single partition
+	}
+	numThreads := getNumberOfThreadsForEncoding(numPartitions, segmentSize, maxThreads)
+
+	// Split rows into thread partitions using original JPEG partition info if available
+	// For progressive JPEGs, Rust uses the full file size as segment size (not just scan data)
+	segmentSizeForHandoffs := segmentSize
+	if jpegResult.Header.JpegType == JpegTypeProgressive {
+		segmentSizeForHandoffs = len(jpegData)
+	}
+	handoffs := splitPartitionsToThreads(jpegResult.Partitions, lumaHeight, numThreads, segmentSizeForHandoffs, jpegResult.Header.JpegType)
+
+	// Encode partitions in parallel
+	encodedPartitions := make([][]byte, numThreads)
+	var wg sync.WaitGroup
+	var encodeErr error
+	var errMu sync.Mutex
+
+	for threadID := 0; threadID < numThreads; threadID++ {
+		wg.Add(1)
+		go func(tid int) {
+			defer wg.Done()
+
+			var buf bytes.Buffer
+			encoder, err := NewLeptonEncoder(&buf, jpegResult.Header)
+			if err != nil {
+				errMu.Lock()
+				if encodeErr == nil {
+					encodeErr = err
+				}
+				errMu.Unlock()
+				return
+			}
+
+			if err := encoder.EncodeRowRange(
+				quantizationTables,
+				jpegResult.ImageData,
+				handoffs[tid].LumaYStart,
+				handoffs[tid].LumaYEnd,
+			); err != nil {
+				errMu.Lock()
+				if encodeErr == nil {
+					encodeErr = err
+				}
+				errMu.Unlock()
+				return
+			}
+
+			if err := encoder.Finish(); err != nil {
+				errMu.Lock()
+				if encodeErr == nil {
+					encodeErr = err
+				}
+				errMu.Unlock()
+				return
+			}
+
+			encodedPartitions[tid] = buf.Bytes()
+		}(threadID)
 	}
 
-	if err := encoder.EncodeRowRange(
-		quantizationTables,
-		jpegResult.ImageData,
-		0,
-		lumaHeight,
-	); err != nil {
-		return err
+	wg.Wait()
+
+	if encodeErr != nil {
+		return encodeErr
 	}
 
-	if err := encoder.Finish(); err != nil {
-		return err
-	}
-
-	// Now multiplex the encoded data (for single thread, simple format)
-	multiplexedData := multiplexSingleThread(encodedData.Bytes())
+	// Multiplex the encoded data from all threads
+	multiplexedData := multiplexEncodedData(encodedPartitions)
 
 	// Write Lepton header (includes CMP marker)
-	headerSize, compressedHeaderSize, err := writeLeptonHeader(writer, jpegResult, []ThreadHandoff{handoff}, len(jpegData))
+	headerSize, compressedHeaderSize, err := writeLeptonHeader(writer, jpegResult, handoffs, len(jpegData))
 	if err != nil {
 		return err
 	}
@@ -94,38 +146,6 @@ func Encode(reader io.Reader, writer io.Writer) error {
 	}
 
 	return nil
-}
-
-// multiplexSingleThread wraps encoded data in the multiplexer format for a single thread
-func multiplexSingleThread(data []byte) []byte {
-	var result bytes.Buffer
-
-	// For single-thread encoding, we wrap data in variable-length blocks
-	// Header byte format: lower 4 bits = thread ID (0), upper 4 bits = 0 for variable length
-	// Followed by 2 bytes little-endian length-1
-	pos := 0
-	for pos < len(data) {
-		// Use blocks of up to 65536 bytes
-		blockSize := len(data) - pos
-		if blockSize > 65536 {
-			blockSize = 65536
-		}
-
-		// Write header byte (thread 0, variable length)
-		result.WriteByte(0)
-
-		// Write length-1 in little endian
-		lenMinus1 := uint16(blockSize - 1)
-		result.WriteByte(byte(lenMinus1 & 0xff))
-		result.WriteByte(byte(lenMinus1 >> 8))
-
-		// Write data
-		result.Write(data[pos : pos+blockSize])
-
-		pos += blockSize
-	}
-
-	return result.Bytes()
 }
 
 // writeLeptonHeader writes the Lepton file header
@@ -215,8 +235,8 @@ func writeLeptonHeader(writer io.Writer, result *JpegReadResult, handoffs []Thre
 	// Byte 14: Flags (0x83 = 0x80 | 0x01 | 0x02 for both 16-bit options)
 	fixedHeader[14] = 0x83
 
-	// Byte 15: Encoder version
-	fixedHeader[15] = 0x01
+	// Byte 15: Encoder version (matching Rust 0.5.6 = 56 = 0x38)
+	fixedHeader[15] = 0x38
 
 	// Bytes 16-19: Git revision (zeros)
 
@@ -254,6 +274,189 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	n, err := w.writer.Write(p)
 	w.count += n
 	return n, err
+}
+
+// getNumberOfThreadsForEncoding determines the number of threads to use based on file size
+// This matches the Rust implementation in lepton_file_writer.rs
+func getNumberOfThreadsForEncoding(numRows, framebufferByteSize, maxThreadsToUse int) int {
+	numThreads := maxThreadsToUse
+	if numThreads > MaxThreadsSupportedByLeptonFormat {
+		numThreads = MaxThreadsSupportedByLeptonFormat
+	}
+
+	// Need at least 2 rows per thread
+	if numRows/2 < numThreads {
+		numThreads = numRows / 2
+		if numThreads < 1 {
+			numThreads = 1
+		}
+	}
+
+	// Reduce threads for small files
+	if framebufferByteSize < SmallFileBytesPerEncodingThread {
+		numThreads = 1
+	} else if framebufferByteSize < SmallFileBytesPerEncodingThread*2 {
+		if numThreads > 2 {
+			numThreads = 2
+		}
+	} else if framebufferByteSize < SmallFileBytesPerEncodingThread*4 {
+		if numThreads > 4 {
+			numThreads = 4
+		}
+	}
+
+	return numThreads
+}
+
+// splitPartitionsToThreads merges JPEG partitions into thread handoffs
+// This matches the Rust split_row_handoffs_to_threads logic
+// totalSegmentSize is the total JPEG scan data size (for calculating partition sizes)
+// jpegType indicates baseline or progressive - progressive uses simplified handoffs
+func splitPartitionsToThreads(partitions []JpegPartition, lumaHeight uint32, numThreads int, totalSegmentSize int, jpegType JpegType) []ThreadHandoff {
+	// If no partitions or single thread, create one covering entire image
+	if len(partitions) == 0 || numThreads <= 1 {
+		return []ThreadHandoff{{
+			LumaYStart:  0,
+			LumaYEnd:    lumaHeight,
+			SegmentSize: uint32(totalSegmentSize),
+		}}
+	}
+
+	numPartitions := len(partitions)
+	handoffs := make([]ThreadHandoff, numThreads)
+
+	// Split partitions evenly among threads (Rust's simplified split logic)
+	partitionsPerThread := float32(numPartitions) / float32(numThreads)
+
+	// Calculate split indices (same as Rust)
+	splitIndices := make([]int, numThreads-1)
+	for i := 0; i < numThreads-1; i++ {
+		splitIndices[i] = int(partitionsPerThread * float32(i+1))
+	}
+
+	for i := 0; i < numThreads; i++ {
+		var beginPartition, endPartition int
+		if i == 0 {
+			beginPartition = 0
+		} else {
+			beginPartition = splitIndices[i-1] + 1
+		}
+		if i == numThreads-1 {
+			endPartition = numPartitions - 1
+		} else {
+			endPartition = splitIndices[i]
+		}
+
+		// For progressive JPEGs, Rust uses simplified handoffs:
+		// - All segment sizes are 0 except the last thread (which gets the total)
+		// - All overhang/lastDC values are zeroed
+		// This is because progressive JPEGs have multiple scans and partition info
+		// from the first scan doesn't apply to the encoded output.
+		if jpegType == JpegTypeProgressive {
+			handoffs[i] = ThreadHandoff{
+				LumaYStart: partitions[beginPartition].LumaYStart,
+				LumaYEnd:   partitions[endPartition].LumaYEnd,
+				// SegmentSize, OverhangByte, NumOverhangBits, LastDC all stay zero
+			}
+			// Only the last thread gets the total segment size
+			if i == numThreads-1 {
+				handoffs[i].SegmentSize = uint32(totalSegmentSize)
+			}
+			continue
+		}
+
+		// For baseline JPEGs, use actual partition positions for segment size calculation
+		var combinedSize int64
+		if endPartition == numPartitions-1 {
+			// Last partition extends to end of segment
+			combinedSize = int64(totalSegmentSize) - partitions[beginPartition].Position
+		} else {
+			// Segment size is from begin partition to start of next partition after end
+			combinedSize = partitions[endPartition+1].Position - partitions[beginPartition].Position
+		}
+
+		handoffs[i] = ThreadHandoff{
+			LumaYStart:      partitions[beginPartition].LumaYStart,
+			LumaYEnd:        partitions[endPartition].LumaYEnd,
+			SegmentSize:     uint32(combinedSize),
+			OverhangByte:    partitions[beginPartition].OverhangByte,
+			NumOverhangBits: partitions[beginPartition].NumOverhangBits,
+			LastDC:          partitions[beginPartition].LastDC,
+		}
+	}
+
+	return handoffs
+}
+
+// encodedPartition holds the result of encoding a single partition
+type encodedPartition struct {
+	threadID int
+	data     []byte
+	err      error
+}
+
+// multiplexEncodedData interleaves encoded data from multiple threads
+// using the same block format as Rust (round-robin with 64KB blocks)
+func multiplexEncodedData(partitions [][]byte) []byte {
+	var result bytes.Buffer
+
+	// Track position in each partition
+	positions := make([]int, len(partitions))
+	const blockSize = 65536
+
+	// Round-robin through partitions
+	for {
+		allDone := true
+		for threadID := 0; threadID < len(partitions); threadID++ {
+			remaining := len(partitions[threadID]) - positions[threadID]
+			if remaining <= 0 {
+				continue
+			}
+			allDone = false
+
+			// Determine block size for this write
+			writeSize := remaining
+			if writeSize > blockSize {
+				writeSize = blockSize
+			}
+
+			// Write block header
+			tid := byte(threadID)
+			lenMinus1 := writeSize - 1
+
+			// Check if length is a special power of 2 (4096, 16384, 65536)
+			if lenMinus1 == 4095 || lenMinus1 == 16383 || lenMinus1 == 65535 {
+				// Compact header: single byte
+				// log2(4096)=12, log2(16384)=14, log2(65536)=16
+				// Formula: (log2(len)/2 - 4) << 4 | tid
+				var shift byte
+				switch lenMinus1 {
+				case 4095:
+					shift = 1 // (12/2 - 4) = 2, but Rust uses (ilog2 >> 1) - 4 = (11 >> 1) - 4 = 1
+				case 16383:
+					shift = 2 // (14/2 - 4) = 3, but (13 >> 1) - 4 = 2
+				case 65535:
+					shift = 3 // (16/2 - 4) = 4, but (15 >> 1) - 4 = 3
+				}
+				result.WriteByte(tid | (shift << 4))
+			} else {
+				// Variable length header: 3 bytes
+				result.WriteByte(tid)
+				result.WriteByte(byte(lenMinus1 & 0xff))
+				result.WriteByte(byte((lenMinus1 >> 8) & 0xff))
+			}
+
+			// Write block data
+			result.Write(partitions[threadID][positions[threadID] : positions[threadID]+writeSize])
+			positions[threadID] += writeSize
+		}
+
+		if allDone {
+			break
+		}
+	}
+
+	return result.Bytes()
 }
 
 // EncodeVerify encodes JPEG to Lepton and verifies by decoding back
