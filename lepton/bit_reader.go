@@ -223,8 +223,16 @@ func (r *BitReader) VerifyResetCode() error {
 // This includes all bytes: data bytes, escape sequences (0xFF 0x00), and restart markers
 func (r *BitReader) StreamPosition() int64 {
 	// physicalConsumed tracks all bytes processed from the stream.
-	// We subtract bytes that are still in the bit register (not yet consumed).
-	// Use ceiling division: if any bits remain from a byte, that byte is not fully consumed.
-	bytesInRegister := int64((r.bitsLeft + 7) / 8)
-	return r.physicalConsumed - bytesInRegister
+	// We need to determine the position of the byte containing unread bits.
+	if r.bitsLeft > 0 && !r.eof {
+		// If the current byte (lowest 8 bits of the register) is 0xFF and it wasn't
+		// a truncated FF, then this byte came from a 2-byte escape sequence (0xFF 0x00).
+		// The position should point to the 0xFF, which is 2 bytes back from the
+		// current physical consumed position.
+		if uint8(r.bits) == 0xff && !r.truncatedFF {
+			return r.physicalConsumed - 2
+		}
+		return r.physicalConsumed - 1
+	}
+	return r.physicalConsumed
 }
