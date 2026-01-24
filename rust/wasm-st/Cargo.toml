@@ -1,0 +1,20 @@
+[package]
+name = "lepton_rust_st"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+
+# Keep this crate out of the parent workspace - it needs special build flags
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# No use_rayon feature - uses SingleThreadPool instead
+lepton_jpeg = { path = "../lib" }
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true

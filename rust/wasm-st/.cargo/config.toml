@@ -1,0 +1,3 @@
+# Single-threaded WASM build - no atomics or shared memory required
+[target.wasm32-unknown-unknown]
+rustflags = []
